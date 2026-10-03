@@ -29,8 +29,7 @@ class BaselineAgent:
         self.force_offline = force_offline
         self.sessions: dict[str, SessionState] = {}
 
-        # TODO: optionally initialize a real LangChain/LangGraph agent when dependencies exist.
-        self.langchain_agent = None
+        self.langchain_agent = None if force_offline else self._maybe_build_langchain_agent()
 
     def reply(self, user_id: str, thread_id: str, message: str) -> dict[str, Any]:
         """Student TODO: return the agent response and token accounting.
@@ -40,15 +39,24 @@ class BaselineAgent:
         - Otherwise use a deterministic offline path.
         """
 
-        raise NotImplementedError
+        if self.langchain_agent is not None:
+            state = self.sessions.setdefault(thread_id, SessionState())
+            prompt_tokens = sum(estimate_tokens(item["content"]) for item in state.messages) + estimate_tokens(message)
+            result = self.langchain_agent.invoke({"messages": [("user", message)]}, config={"configurable": {"thread_id": thread_id}})
+            content = result["messages"][-1].content
+            state.messages.extend([{"role": "user", "content": message}, {"role": "assistant", "content": str(content)}])
+            state.prompt_tokens_processed += prompt_tokens
+            state.token_usage += estimate_tokens(str(content))
+            return {"response": str(content), "tokens": estimate_tokens(str(content)), "prompt_tokens": prompt_tokens}
+        return self._reply_offline(thread_id, message)
 
     def token_usage(self, thread_id: str) -> int:
         # TODO: return cumulative agent token count for one thread.
-        raise NotImplementedError
+        return self.sessions.get(thread_id, SessionState()).token_usage
 
     def prompt_token_usage(self, thread_id: str) -> int:
         # TODO: estimate how much prompt context this baseline kept processing.
-        raise NotImplementedError
+        return self.sessions.get(thread_id, SessionState()).prompt_tokens_processed
 
     def compaction_count(self, thread_id: str) -> int:
         # Baseline has no compact memory.
@@ -64,7 +72,16 @@ class BaselineAgent:
         - Never remember facts across different thread ids
         """
 
-        raise NotImplementedError
+        state = self.sessions.setdefault(thread_id, SessionState())
+        prompt_tokens = sum(estimate_tokens(item["content"]) for item in state.messages) + estimate_tokens(message)
+        state.messages.append({"role": "user", "content": message})
+        # This deliberately uses only the current session: no profile is consulted.
+        response = "Mình đã nhận được nội dung trong phiên hiện tại."
+        state.messages.append({"role": "assistant", "content": response})
+        generated = estimate_tokens(response)
+        state.token_usage += generated
+        state.prompt_tokens_processed += prompt_tokens
+        return {"response": response, "tokens": generated, "prompt_tokens": prompt_tokens}
 
     def _maybe_build_langchain_agent(self):
         """Student TODO: optionally wire `create_agent` + `InMemorySaver` here.
@@ -72,4 +89,9 @@ class BaselineAgent:
         Use `build_chat_model(self.config.model)` so the baseline can run with any supported provider.
         """
 
-        raise NotImplementedError
+        try:
+            from langgraph.checkpoint.memory import InMemorySaver
+            from langchain.agents import create_agent
+            return create_agent(build_chat_model(self.config.model), checkpointer=InMemorySaver())
+        except (ImportError, ModuleNotFoundError):
+            return None
